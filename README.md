@@ -74,3 +74,7 @@ Linux/macOS with Mono:
 ```
 mcs -target:winexe -sdk:4.5 -optimize+ -out:LabSolutionsBackupTool.exe -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:System.Xml.dll -r:System.Core.dll -r:System.ServiceProcess.dll -r:System.IO.Compression.dll -r:System.IO.Compression.FileSystem.dll src/LabSolutionsBackupTool.cs
 ```
+
+## License
+
+MIT - see [LICENSE](LICENSE).
