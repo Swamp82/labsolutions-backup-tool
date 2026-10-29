@@ -19,6 +19,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
@@ -46,6 +47,7 @@ static class Paths
     public const string ToolDir = @"C:\LabSolutions\BackupTool";
     public static readonly string ToolExe = Path.Combine(ToolDir, "LabSolutionsBackupTool.exe");
     public static readonly string Log = Path.Combine(ToolDir, "LabSolutionsBackupTool.log");
+    public static readonly string UnpackDir = Path.Combine(ToolDir, "Restore");
     public const string TaskName = "LabSolutions System Backup";
     public const double LowSpaceGB = 20;
 }
@@ -201,6 +203,85 @@ static class Config
     }
 }
 
+// Packs a backup folder into one .zip file and unpacks it again, for moving a backup to another PC.
+static class Packer
+{
+    // The full backup a folder belongs to (a differential backup needs its full backup).
+    public static string FullBackupOf(string folder)
+    {
+        for (var d = new DirectoryInfo(folder); d != null; d = d.Parent)
+            if (Regex.IsMatch(d.Name, @"^FullBackup_\d{14}$")) return d.FullName;
+        return folder;
+    }
+
+    public static void Pack(string folder, string zipPath, Action<int> progress)
+    {
+        var root = new DirectoryInfo(folder);
+        FileInfo[] files = root.GetFiles("*", SearchOption.AllDirectories);
+        long total = Math.Max(1, files.Sum(f => f.Length)), done = 0;
+        // Written under a temporary name first, so a half-written file is never mistaken for a backup.
+        string partial = zipPath + ".partial";
+        if (File.Exists(partial)) File.Delete(partial);
+        using (ZipArchive zip = ZipFile.Open(partial, ZipArchiveMode.Create))
+        {
+            foreach (FileInfo f in files)
+            {
+                string relative = f.FullName.Substring(root.FullName.Length).TrimStart('\\').Replace('\\', '/');
+                zip.CreateEntryFromFile(f.FullName, root.Name + "/" + relative, CompressionLevel.Optimal);
+                done += f.Length;
+                progress((int)(done * 100 / total));
+            }
+        }
+        if (File.Exists(zipPath)) File.Delete(zipPath);
+        File.Move(partial, zipPath);
+    }
+
+    // Where the .zip will be unpacked, and the backup folder it will produce.
+    public static void Plan(string zipPath, string targetRoot, out string extractTo, out string backupFolder, out long size)
+    {
+        using (ZipArchive zip = ZipFile.OpenRead(zipPath))
+        {
+            List<string> names = zip.Entries.Select(e => e.FullName.Replace('\\', '/')).ToList();
+            List<string> tops = names.Select(n => n.Split('/')[0]).Distinct().ToList();
+            size = zip.Entries.Sum(e => e.Length);
+            if (tops.Count == 1 && names.All(n => n.Contains("/")))
+            {
+                extractTo = targetRoot;
+                backupFolder = Path.Combine(targetRoot, tops[0]);
+            }
+            else
+            {
+                extractTo = backupFolder = Path.Combine(targetRoot, Path.GetFileNameWithoutExtension(zipPath));
+            }
+        }
+    }
+
+    public static void Unpack(string zipPath, string extractTo, Action<int> progress)
+    {
+        string root = Path.GetFullPath(extractTo).TrimEnd('\\') + "\\";
+        using (ZipArchive zip = ZipFile.OpenRead(zipPath))
+        {
+            long total = Math.Max(1, zip.Entries.Sum(e => e.Length)), done = 0;
+            foreach (ZipArchiveEntry entry in zip.Entries)
+            {
+                string name = entry.FullName.Replace('/', '\\');
+                string path = Path.GetFullPath(Path.Combine(root, name));
+                if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("The file contains an unsafe path: " + entry.FullName);
+                if (name.EndsWith("\\"))
+                {
+                    Directory.CreateDirectory(path);
+                    continue;
+                }
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                entry.ExtractToFile(path, true);
+                done += entry.Length;
+                progress((int)(done * 100 / total));
+            }
+        }
+    }
+}
+
 class RestorePoint
 {
     public string Path;
@@ -229,14 +310,22 @@ static class Restore
 
         foreach (DirectoryInfo d in candidates)
         {
-            Match m = Regex.Match(d.Name, @"^(FullBackup|DiffBackup)_(\d{14})$");
-            if (!m.Success) continue;
-            DateTime date;
-            DateTime.TryParseExact(m.Groups[2].Value, "yyyyMMddHHmmss", null,
-                System.Globalization.DateTimeStyles.None, out date);
-            bool diff = m.Groups[1].Value == "DiffBackup";
             bool complete = false;
             try { complete = d.GetFiles("LSSSystemBackupInfo*").Length > 0; } catch { }
+            Match m = Regex.Match(d.Name, @"^(FullBackup|DiffBackup)_(\d{14})$");
+            DateTime date;
+            if (m.Success)
+            {
+                DateTime.TryParseExact(m.Groups[2].Value, "yyyyMMddHHmmss", null,
+                    System.Globalization.DateTimeStyles.None, out date);
+            }
+            else if (d == candidates[0] && complete)
+            {
+                // A backup folder with another name, for example unpacked from a renamed .zip.
+                date = d.LastWriteTime;
+            }
+            else continue;
+            bool diff = m.Success && m.Groups[1].Value == "DiffBackup";
             points.Add(new RestorePoint
             {
                 Path = d.FullName,
@@ -322,6 +411,12 @@ static class Backup
             {
                 f.Delete(true);
                 Util.Log("Deleted old backup " + f.FullName);
+                string zip = f.FullName + ".zip";
+                if (File.Exists(zip))
+                {
+                    File.Delete(zip);
+                    Util.Log("Deleted old backup file " + zip);
+                }
             }
             catch (Exception ex)
             {
@@ -552,6 +647,10 @@ class MainForm : Form
     string restorePath, restoreLog;
     bool serviceStopped;
 
+    CheckBox chkPack;
+    Button btnSaveZip, btnOpenZip;
+    bool busy;   // packing or unpacking a .zip
+
     static readonly Dictionary<string, string> Labels = new Dictionary<string, string>
     {
         { "BackupPath", "Backup folder" },
@@ -605,6 +704,7 @@ class MainForm : Form
         btnRun.Click += (s, e) => RunBackup();
         Add(grp, new Button(), 172, 52, 140, 30, "Open backup folder").Click += (s, e) => OpenBackupFolder();
         Add(grp, new Button(), 320, 52, 140, 30, "Open last report").Click += (s, e) => OpenReport();
+        chkPack = Add(grp, new CheckBox(), 470, 52, 190, 34, "Also save it as one file (.zip) to move to another PC");
         lblStatus = Add(grp, new Label(), 14, 86, 630, 20, "Ready.");
 
         // 3. Cleanup
@@ -642,6 +742,11 @@ class MainForm : Form
 
         timer.Tick += (s, e) => BackupTick();
         Load += (s, e) => LoadSettings();
+        FormClosing += (s, e) =>
+        {
+            if (busy && !Ask("A .zip file is still being written or unpacked. Close anyway? The file will be incomplete."))
+                e.Cancel = true;
+        };
     }
 
     void BuildRestoreTab(TabPage page)
@@ -657,9 +762,11 @@ class MainForm : Form
         lstRestore.Columns.Add("Backup date", 140);
         lstRestore.Columns.Add("Type", 230);
         lstRestore.Columns.Add("Folder", 246);
-        Add(grp, new Button(), 12, 212, 120, 28, "Refresh list").Click += (s, e) => RefreshRestoreList();
-        Add(grp, new Label(), 140, 218, 510, 20,
-            "Newest first. Choosing a differential backup also restores its full backup.");
+        Add(grp, new Button(), 12, 212, 110, 28, "Refresh list").Click += (s, e) => RefreshRestoreList();
+        btnSaveZip = Add(grp, new Button(), 130, 212, 250, 28, "Save selected backup as one file (.zip)...");
+        btnSaveZip.Click += (s, e) => SaveSelectedAsZip();
+        btnOpenZip = Add(grp, new Button(), 388, 212, 264, 28, "Restore from a one-file backup (.zip)...");
+        btnOpenZip.Click += (s, e) => UnpackZip();
 
         // 2. Options
         grp = Add(page, new GroupBox(), 6, 258, 664, 90, "2. Restore options");
@@ -688,6 +795,152 @@ class MainForm : Form
         lblRestoreStatus = Add(grp, new Label(), 12, 100, 640, 20, "");
 
         restoreTimer.Tick += (s, e) => RestoreTick();
+    }
+
+    // Runs slow work (packing / unpacking) without freezing the window.
+    void RunInBackground(string what, Label status, Action<Action<int>> work, Action whenDone)
+    {
+        busy = true;
+        btnRun.Enabled = btnRestore.Enabled = btnSaveZip.Enabled = btnOpenZip.Enabled = false;
+        status.ForeColor = Color.DarkBlue;
+        status.Text = what + "...";
+        int last = -1;
+        Action<int> progress = pct =>
+        {
+            if (pct == last) return;
+            last = pct;
+            BeginInvoke((Action)(() => status.Text = what + "... " + pct + "%"));
+        };
+        var thread = new System.Threading.Thread(() =>
+        {
+            Exception error = null;
+            try { work(progress); }
+            catch (Exception ex) { error = ex; }
+            BeginInvoke((Action)(() =>
+            {
+                busy = false;
+                btnRun.Enabled = btnRestore.Enabled = btnSaveZip.Enabled = btnOpenZip.Enabled = true;
+                if (error != null)
+                {
+                    status.ForeColor = Color.DarkRed;
+                    status.Text = what + " failed.";
+                    Error(what + " failed.\r\n\r\n" + error.Message);
+                }
+                else whenDone();
+            }));
+        });
+        thread.IsBackground = true;
+        thread.Start();
+    }
+
+    void PackInBackground(string folder, string zipPath, Label status)
+    {
+        Util.Log("Saving " + folder + " as one file: " + zipPath);
+        RunInBackground("Saving the backup as one file", status, progress => Packer.Pack(folder, zipPath, progress), () =>
+        {
+            long mb = new FileInfo(zipPath).Length / 1048576;
+            status.ForeColor = Color.DarkGreen;
+            status.Text = "Saved as one file: " + Path.GetFileName(zipPath) + " (" + mb + " MB).";
+            Info("The backup was saved as one file (" + mb + " MB):\r\n" + zipPath +
+                 "\r\n\r\nCopy it to the new PC, open this tool there, and on the Restore tab click " +
+                 "'Restore from a one-file backup (.zip)'.");
+        });
+    }
+
+    void SaveSelectedAsZip()
+    {
+        if (lstRestore.SelectedItems.Count == 0)
+        {
+            Error("Choose a backup in the list first.");
+            return;
+        }
+        string selected = (string)lstRestore.SelectedItems[0].Tag;
+        string folder = Packer.FullBackupOf(selected);
+        if (!string.Equals(folder, selected, StringComparison.OrdinalIgnoreCase))
+            Util.Log("A differential backup needs its full backup, so all of " + Path.GetFileName(folder) +
+                     " (with its differential backups) is saved.");
+        using (var dlg = new SaveFileDialog
+        {
+            Title = "Save the backup as one file",
+            Filter = "Backup file (*.zip)|*.zip",
+            FileName = Path.GetFileName(folder) + ".zip",
+            OverwritePrompt = true
+        })
+        {
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            string zipFull = Path.GetFullPath(dlg.FileName);
+            if (zipFull.StartsWith(Path.GetFullPath(folder).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))
+            {
+                Error("Save the file outside the backup folder itself, for example on the USB stick.");
+                return;
+            }
+            PackInBackground(folder, zipFull, lblRestoreStatus);
+        }
+    }
+
+    void UnpackZip()
+    {
+        string zipPath;
+        using (var dlg = new OpenFileDialog { Title = "Choose the one-file backup", Filter = "Backup file (*.zip)|*.zip" })
+        {
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            zipPath = dlg.FileName;
+        }
+
+        string targetRoot = Paths.UnpackDir, extractTo, backupFolder;
+        long size;
+        try { Packer.Plan(zipPath, targetRoot, out extractTo, out backupFolder, out size); }
+        catch (Exception ex)
+        {
+            Error("This file cannot be opened as a .zip file.\r\n\r\n" + ex.Message);
+            return;
+        }
+
+        double? free = Util.FreeSpaceGB(targetRoot);
+        double neededGB = Math.Round(size / 1073741824.0 + 1, 1);
+        if (free.HasValue && free.Value < neededGB)
+        {
+            if (!Ask("The backup needs about " + neededGB + " GB to unpack, but drive " + targetRoot.Substring(0, 2) +
+                     " has only " + free.Value + " GB free.\r\n\r\nChoose a folder on another local drive?"))
+                return;
+            using (var dlg = new FolderBrowserDialog { ShowNewFolderButton = true, Description = "Unpack the backup into:" })
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                targetRoot = dlg.SelectedPath;
+            }
+            Packer.Plan(zipPath, targetRoot, out extractTo, out backupFolder, out size);
+        }
+
+        bool replace = Directory.Exists(backupFolder);
+        if (replace && !Ask("This backup was unpacked before:\r\n" + backupFolder + "\r\n\r\nReplace it with the contents of the file?"))
+            return;
+
+        Util.Log("Unpacking " + zipPath + " to " + extractTo);
+        RunInBackground("Unpacking the backup", lblRestoreStatus, progress =>
+        {
+            if (replace) Directory.Delete(backupFolder, true);
+            Directory.CreateDirectory(extractTo);
+            Packer.Unpack(zipPath, extractTo, progress);
+        }, () =>
+        {
+            txtRestoreRoot.Text = Path.GetFileName(backupFolder).StartsWith("FullBackup_") ? Path.GetDirectoryName(backupFolder) : backupFolder;
+            RefreshRestoreList();
+            ListViewItem match = lstRestore.Items.Cast<ListViewItem>().FirstOrDefault(i =>
+                ((string)i.Tag).StartsWith(backupFolder, StringComparison.OrdinalIgnoreCase));
+            if (match == null)
+            {
+                Error("The file was unpacked to " + backupFolder + ", but it does not look like a LabSolutions backup.");
+                return;
+            }
+            match.Selected = true;
+            match.EnsureVisible();
+            lstRestore.Focus();
+            lblRestoreStatus.ForeColor = Color.DarkGreen;
+            lblRestoreStatus.Text = "Unpacked. The backup is selected in the list - check the options, then click Restore.";
+            Info("The backup was unpacked to:\r\n" + backupFolder + "\r\n\r\n" +
+                 "It is now selected in the list. Before restoring on a new PC, LabSolutions must be installed there " +
+                 "and its database created in the same folder as on the old PC (manual section 4).");
+        });
     }
 
     void LoadRestoreSettings()
@@ -1144,6 +1397,11 @@ class MainForm : Form
         {
             SetStatus("Backup finished. Open the report to confirm \"Total: OK\".", Color.DarkGreen);
             Info(r.Summary);
+            if (chkPack.Checked)
+            {
+                string folder = Packer.FullBackupOf(Path.GetDirectoryName(r.Report));
+                PackInBackground(folder, folder + ".zip", lblStatus);
+            }
         }
         else
         {

@@ -31,6 +31,14 @@ Windows SmartScreen may warn that the program is unsigned: click **More info →
   If the schedule also cleans up old backups or runs a differential backup, the tool copies itself to
   `C:\LabSolutions\BackupTool\` so the schedule works without the USB stick.
 
+**One-file backups (moving to another PC)**
+- Tick "Also save it as one file (.zip)" on the Backup tab, or pick any backup on the Restore tab and click
+  "Save selected backup as one file (.zip)" (for example straight to a USB stick). A differential backup is
+  saved together with its full backup.
+- On the new PC, click "Restore from a one-file backup (.zip)". The tool unpacks it to
+  `C:\LabSolutions\BackupTool\Restore\` (or another local drive if C is short of space) and selects it in the list.
+- LabSolutions must already be installed on the new PC, with its database created in the same folder as on the old PC.
+
 **Restore tab**
 - Lists the full and differential backups in the backup folder, newest first.
 - Writes `RestorePath`, `RestoreMode` and `WorkFolder` to
@@ -58,11 +66,11 @@ Single C# file, no project needed.
 Windows (the compiler ships with .NET Framework):
 
 ```
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /optimize+ /out:LabSolutionsBackupTool.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Xml.dll /r:System.Core.dll /r:System.ServiceProcess.dll src\LabSolutionsBackupTool.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /optimize+ /out:LabSolutionsBackupTool.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Xml.dll /r:System.Core.dll /r:System.ServiceProcess.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll src\LabSolutionsBackupTool.cs
 ```
 
 Linux/macOS with Mono:
 
 ```
-mcs -target:winexe -sdk:4.5 -optimize+ -out:LabSolutionsBackupTool.exe -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:System.Xml.dll -r:System.Core.dll -r:System.ServiceProcess.dll src/LabSolutionsBackupTool.cs
+mcs -target:winexe -sdk:4.5 -optimize+ -out:LabSolutionsBackupTool.exe -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:System.Xml.dll -r:System.Core.dll -r:System.ServiceProcess.dll -r:System.IO.Compression.dll -r:System.IO.Compression.FileSystem.dll src/LabSolutionsBackupTool.cs
 ```
