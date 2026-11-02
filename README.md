@@ -8,7 +8,7 @@ It replaces hand-editing XML files in Notepad and setting up Task Scheduler by h
 
 ## Download and run
 
-1. Download `LabSolutionsBackupTool.exe`.
+1. Download `LabSolutionsBackupTool.exe` from the [latest release](https://github.com/Swamp82/labsolutions-backup-tool/releases/latest).
 2. Copy it to the LabSolutions PC (a USB stick is fine). There is nothing to install.
 3. Double-click it and allow administrator rights.
 
@@ -48,7 +48,7 @@ Windows SmartScreen may warn that the program is unsigned: click **More info →
 - Tick "Also save it as one file (.zip)" on the Backup tab, or pick any backup on the Restore tab and click
   "Save selected backup as one file (.zip)" (for example straight to a USB stick). A differential backup is
   saved together with its full backup.
-- On the new PC, click "Restore from a one-file backup (.zip)". The tool unpacks it to
+- On the new PC, on the Restore tab, click "Choose a one-file backup (.zip)...". The tool unpacks it to
   `C:\ProgramData\LabSolutionsBackupTool\Restore\` (or another local drive if C is short of space) and selects it in the list.
 - LabSolutions must already be installed on the new PC, with its database created in the same folder as on the old PC.
 
