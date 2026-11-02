@@ -17,6 +17,19 @@ Windows SmartScreen may warn that the program is unsigned: click **More info →
 
 ## What it does
 
+| Backup | Restore |
+|---|---|
+| ![Backup tab](screenshots/backup-tab.png) | ![Restore tab](screenshots/restore-tab.png) |
+
+*(Screenshots from a preview build; on Windows the window uses the normal Windows look.)*
+
+**Finds LabSolutions by itself**
+- Looks in the usual places (`C:\LabSolutions`, `C:\Program Files (x86)\LabSolutions` on every drive),
+  the `LSSService` registration and the LabSolutions installer entries in the registry.
+- If it is not there, it searches all local drives. You can also point to the folder with **Choose folder...**.
+- The found location is remembered in `C:\ProgramData\LabSolutionsBackupTool\locations.txt`.
+
+
 **Backup tab**
 - Reads and edits `C:\LabSolutions\System\config\LSSSystemBackupConfiguration.xml`
   (backup folder, authentication DB backup folder, temp work folder, verify).
@@ -29,25 +42,27 @@ Windows SmartScreen may warn that the program is unsigned: click **More info →
 - Deletes old backups, keeping the newest N `FullBackup_<date>` folders.
 - Creates the Task Scheduler job (daily or weekly, run whether user is logged on or not, highest privileges).
   If the schedule also cleans up old backups or runs a differential backup, the tool copies itself to
-  `C:\LabSolutions\BackupTool\` so the schedule works without the USB stick.
+  `C:\ProgramData\LabSolutionsBackupTool\` so the schedule works without the USB stick.
 
 **One-file backups (moving to another PC)**
 - Tick "Also save it as one file (.zip)" on the Backup tab, or pick any backup on the Restore tab and click
   "Save selected backup as one file (.zip)" (for example straight to a USB stick). A differential backup is
   saved together with its full backup.
 - On the new PC, click "Restore from a one-file backup (.zip)". The tool unpacks it to
-  `C:\LabSolutions\BackupTool\Restore\` (or another local drive if C is short of space) and selects it in the list.
+  `C:\ProgramData\LabSolutionsBackupTool\Restore\` (or another local drive if C is short of space) and selects it in the list.
 - LabSolutions must already be installed on the new PC, with its database created in the same folder as on the old PC.
 
 **Restore tab**
-- Lists the full and differential backups in the backup folder, newest first.
+- **Choose a backup folder...** (a `FullBackup_<date>` folder, or a folder containing them, on any drive,
+  USB stick or network share) or **Choose a one-file backup (.zip)...**.
+- Lists the full and differential backups found there, newest first.
 - Writes `RestorePath`, `RestoreMode` and `WorkFolder` to
   `C:\LabSolutions\System\config\LSSSystemRestoreConfiguration.xml` (with a dated copy of the old file).
 - Stops `LSSService`, runs `LSSSystemRestore.exe` (you answer its questions in its own window),
   checks for the restore log, and offers to restart the PC. If the restore is cancelled, it offers to
   start `LSSService` again.
 
-The tool's own log is `C:\LabSolutions\BackupTool\LabSolutionsBackupTool.log`.
+The tool's own log is `C:\ProgramData\LabSolutionsBackupTool\LabSolutionsBackupTool.log`.
 
 ## Command line
 

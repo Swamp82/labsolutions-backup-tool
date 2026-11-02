@@ -1,7 +1,8 @@
 // LabSolutions Backup Tool - portable, single .exe (.NET Framework 4, included in Windows 10/11).
 //
 // A small window for the LabSolutions System Backup function (Shimadzu manual 223-11702D):
-//   - edits C:\LabSolutions\System\config\LSSSystemBackupConfiguration.xml
+//   - finds the LabSolutions folders on this PC (usual places, registry, then a search of all drives)
+//   - edits <LabSolutions>\System\config\LSSSystemBackupConfiguration.xml
 //     (a dated copy of the old file is kept next to it)
 //   - creates the folders and warns about mapped drives / low disk space
 //   - runs LSSSystemBackup.exe (full) or LSSSystemBackup_diff.bat (differential)
@@ -35,21 +36,192 @@ using Microsoft.Win32;
 static class Paths
 {
     public const string AppTitle = "LabSolutions Backup Tool";
-    public const string Config = @"C:\LabSolutions\System\config\LSSSystemBackupConfiguration.xml";
-    public const string LabSolutionsDir = @"C:\Program Files (x86)\LabSolutions";
-    public static readonly string BackupExe = Path.Combine(LabSolutionsDir, "LSSSystemBackup.exe");
-    public static readonly string DiffBat = Path.Combine(LabSolutionsDir, "LSSSystemBackup_diff.bat");
-    public const string RestoreConfig = @"C:\LabSolutions\System\config\LSSSystemRestoreConfiguration.xml";
-    public static readonly string RestoreExe = Path.Combine(LabSolutionsDir, "LSSSystemRestore.exe");
+
+    // Found on this PC by Locator, or chosen by the user. Null until then.
+    public static string SystemDir;    // usually C:\LabSolutions (holds System\config)
+    public static string ProgramDir;   // usually C:\Program Files (x86)\LabSolutions (holds LSSSystemBackup.exe)
+
+    public const string BackupConfigName = @"System\config\LSSSystemBackupConfiguration.xml";
+    public const string RestoreConfigName = @"System\config\LSSSystemRestoreConfiguration.xml";
+    public static string Config { get { return In(SystemDir, BackupConfigName); } }
+    public static string RestoreConfig { get { return In(SystemDir, RestoreConfigName); } }
+    public static string LabSolutionsDir { get { return ProgramDir; } }
+    public static string BackupExe { get { return In(ProgramDir, "LSSSystemBackup.exe"); } }
+    public static string DiffBat { get { return In(ProgramDir, "LSSSystemBackup_diff.bat"); } }
+    public static string RestoreExe { get { return In(ProgramDir, "LSSSystemRestore.exe"); } }
     public const string ServiceName = "LSSService";
-    // The tool keeps its log here, and copies itself here when a schedule needs it,
-    // so the schedule keeps working after the USB stick is removed.
-    public const string ToolDir = @"C:\LabSolutions\BackupTool";
+
+    // The tool keeps its log and the found locations here, and copies itself here when a
+    // schedule needs it, so the schedule keeps working after the USB stick is removed.
+    public static readonly string ToolDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "LabSolutionsBackupTool");
     public static readonly string ToolExe = Path.Combine(ToolDir, "LabSolutionsBackupTool.exe");
     public static readonly string Log = Path.Combine(ToolDir, "LabSolutionsBackupTool.log");
+    public static readonly string LocationsFile = Path.Combine(ToolDir, "locations.txt");
     public static readonly string UnpackDir = Path.Combine(ToolDir, "Restore");
     public const string TaskName = "LabSolutions System Backup";
     public const double LowSpaceGB = 20;
+
+    static string In(string dir, string name)
+    {
+        return dir == null ? "" : Path.Combine(dir, name);
+    }
+}
+
+// Finds the LabSolutions folders on this PC.
+static class Locator
+{
+    public static bool IsSystemDir(string dir)
+    {
+        return File.Exists(Path.Combine(dir, Paths.BackupConfigName)) || File.Exists(Path.Combine(dir, Paths.RestoreConfigName));
+    }
+
+    public static bool IsProgramDir(string dir)
+    {
+        return File.Exists(Path.Combine(dir, "LSSSystemBackup.exe")) || File.Exists(Path.Combine(dir, "LSSSystemRestore.exe"));
+    }
+
+    // Checks a folder and sets whichever of the two it is. Returns true when both are known.
+    static bool Try(string dir, ref string system, ref string program)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return system != null && program != null;
+            dir = Path.GetFullPath(dir).TrimEnd('\\');
+            if (system == null && IsSystemDir(dir)) system = dir;
+            if (program == null && IsProgramDir(dir)) program = dir;
+        }
+        catch { }
+        return system != null && program != null;
+    }
+
+    // Fast: remembered locations, the LSSService registration, the installer entries, the usual folders.
+    public static void FindQuick(out string system, out string program)
+    {
+        system = program = null;
+        foreach (string dir in QuickCandidates())
+            if (Try(dir, ref system, ref program)) return;
+    }
+
+    static IEnumerable<string> QuickCandidates()
+    {
+        var list = new List<string>();
+        try
+        {
+            foreach (string line in File.ReadAllLines(Paths.LocationsFile))
+            {
+                int eq = line.IndexOf('=');
+                if (eq > 0) list.Add(line.Substring(eq + 1).Trim());
+            }
+        }
+        catch { }
+
+        foreach (RegistryView view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+        {
+            try
+            {
+                using (RegistryKey hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view))
+                {
+                    using (RegistryKey svc = hklm.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + Paths.ServiceName))
+                    {
+                        string image = svc == null ? null : svc.GetValue("ImagePath") as string;
+                        if (!string.IsNullOrEmpty(image)) list.AddRange(ParentsOf(ExePath(image)));
+                    }
+                    using (RegistryKey uninstall = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+                    {
+                        if (uninstall == null) continue;
+                        foreach (string name in uninstall.GetSubKeyNames())
+                        {
+                            using (RegistryKey app = uninstall.OpenSubKey(name))
+                            {
+                                string display = app == null ? null : app.GetValue("DisplayName") as string;
+                                if (display == null || display.IndexOf("LabSolutions", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                                string location = app.GetValue("InstallLocation") as string;
+                                if (!string.IsNullOrEmpty(location)) list.Add(location.Trim('"'));
+                                string icon = app.GetValue("DisplayIcon") as string;
+                                if (!string.IsNullOrEmpty(icon)) list.AddRange(ParentsOf(ExePath(icon.Split(',')[0])));
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        foreach (DriveInfo drive in FixedDrives())
+        {
+            string root = drive.RootDirectory.FullName;
+            list.Add(Path.Combine(root, "LabSolutions"));
+            list.Add(Path.Combine(root, @"Program Files (x86)\LabSolutions"));
+            list.Add(Path.Combine(root, @"Program Files\LabSolutions"));
+            list.Add(Path.Combine(root, @"Shimadzu\LabSolutions"));
+        }
+        return list;
+    }
+
+    static string ExePath(string commandLine)
+    {
+        commandLine = Environment.ExpandEnvironmentVariables(commandLine.Trim());
+        if (commandLine.StartsWith("\""))
+        {
+            int end = commandLine.IndexOf('"', 1);
+            return end > 0 ? commandLine.Substring(1, end - 1) : commandLine.Trim('"');
+        }
+        int exe = commandLine.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+        return exe > 0 ? commandLine.Substring(0, exe + 4) : commandLine;
+    }
+
+    static IEnumerable<string> ParentsOf(string file)
+    {
+        var dirs = new List<string>();
+        try
+        {
+            for (DirectoryInfo d = new FileInfo(file).Directory; d != null && dirs.Count < 3; d = d.Parent)
+                dirs.Add(d.FullName);
+        }
+        catch { }
+        return dirs;
+    }
+
+    static IEnumerable<DriveInfo> FixedDrives()
+    {
+        try { return DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady).ToList(); }
+        catch { return new List<DriveInfo>(); }
+    }
+
+    // Slow: looks through the folders on every local drive, a few levels deep.
+    public static void Search(Action<string> progress, ref string system, ref string program)
+    {
+        string[] skip = { "Windows", "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs", "Config.Msi" };
+        foreach (DriveInfo drive in FixedDrives())
+        {
+            var queue = new Queue<KeyValuePair<string, int>>();
+            queue.Enqueue(new KeyValuePair<string, int>(drive.RootDirectory.FullName, 0));
+            while (queue.Count > 0)
+            {
+                var item = queue.Dequeue();
+                if (Try(item.Key, ref system, ref program)) return;
+                if (item.Value >= 4) continue;
+                progress(item.Key);
+                string[] subs;
+                try { subs = Directory.GetDirectories(item.Key); }
+                catch { continue; }
+                foreach (string sub in subs)
+                    if (!skip.Contains(Path.GetFileName(sub), StringComparer.OrdinalIgnoreCase))
+                        queue.Enqueue(new KeyValuePair<string, int>(sub, item.Value + 1));
+            }
+        }
+    }
+
+    public static void Remember()
+    {
+        try
+        {
+            Directory.CreateDirectory(Paths.ToolDir);
+            File.WriteAllLines(Paths.LocationsFile, new[] { "system=" + Paths.SystemDir, "program=" + Paths.ProgramDir });
+        }
+        catch { }
+    }
 }
 
 static class Util
@@ -156,10 +328,10 @@ static class Util
 
 static class Config
 {
-    public static XmlDocument Load(string path = Paths.Config)
+    public static XmlDocument Load(string path = null)
     {
         var xml = new XmlDocument { PreserveWhitespace = true };
-        xml.Load(path);
+        xml.Load(path ?? Paths.Config);
         return xml;
     }
 
@@ -330,12 +502,19 @@ static class Restore
             {
                 Path = d.FullName,
                 Date = date,
-                Type = diff ? "Differential (+ full backup " + d.Parent.Name.Replace("FullBackup_", "") + ")" : "Full",
+                Type = diff ? "Differential (on full of " + FullDate(d.Parent.Name) + ")" : "Full",
                 LooksComplete = complete
             });
         }
         return points.GroupBy(p => p.Path, StringComparer.OrdinalIgnoreCase).Select(g => g.First())
             .OrderByDescending(p => p.Date).ToList();
+    }
+
+    static string FullDate(string fullBackupName)
+    {
+        DateTime date;
+        return DateTime.TryParseExact(fullBackupName.Replace("FullBackup_", ""), "yyyyMMddHHmmss", null,
+            System.Globalization.DateTimeStyles.None, out date) ? date.ToString("yyyy-MM-dd") : fullBackupName;
     }
 
     // Returns false if the service does not exist.
@@ -551,12 +730,6 @@ static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        if (!File.Exists(Paths.Config))
-        {
-            MessageBox.Show("The LabSolutions backup settings file was not found:\r\n" + Paths.Config +
-                "\r\n\r\nIs LabSolutions installed on this PC?", Paths.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return 1;
-        }
         Application.Run(new MainForm());
         return 0;
     }
@@ -566,6 +739,12 @@ static class Program
     {
         try
         {
+            Locator.FindQuick(out Paths.SystemDir, out Paths.ProgramDir);
+            if (Paths.SystemDir == null || Paths.ProgramDir == null)
+            {
+                Util.Log("ERROR: LabSolutions was not found on this PC. Open the tool once to find it.");
+                return 1;
+            }
             string backupPath = Config.Get(Config.Load(), "BackupPath");
             DateTime start = DateTime.Now;
             Util.Log("Scheduled backup started (" + (diff ? "differential" : "full") + ").");
@@ -649,7 +828,11 @@ class MainForm : Form
 
     CheckBox chkPack;
     Button btnSaveZip, btnOpenZip;
-    bool busy;   // packing or unpacking a .zip
+    bool busy;   // packing or unpacking a .zip, or searching for LabSolutions
+
+    TabControl tabs;
+    Label lblLocation;
+    Button btnSearch, btnChooseLs;
 
     static readonly Dictionary<string, string> Labels = new Dictionary<string, string>
     {
@@ -670,14 +853,23 @@ class MainForm : Form
     public MainForm()
     {
         Text = Paths.AppTitle;
-        ClientSize = new Size(700, 740);
+        ClientSize = new Size(700, 796);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         Font = new Font("Segoe UI", 9);
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-        var tabs = Add(this, new TabControl(), 8, 8, 684, 522);
+        // Header: where LabSolutions is on this PC
+        var header = Add(this, new Panel { BackColor = Color.FromArgb(232, 240, 250) }, 0, 0, 700, 56);
+        Add(header, new Label { Font = new Font("Segoe UI", 9, FontStyle.Bold) }, 12, 8, 450, 20, "LabSolutions on this PC");
+        lblLocation = Add(header, new Label { AutoEllipsis = true }, 12, 28, 460, 20, "Looking for LabSolutions...");
+        btnSearch = Add(header, new Button { BackColor = SystemColors.Control }, 480, 14, 96, 28, "Search again");
+        btnSearch.Click += (s, e) => SearchLabSolutions();
+        btnChooseLs = Add(header, new Button { BackColor = SystemColors.Control }, 584, 14, 106, 28, "Choose folder...");
+        btnChooseLs.Click += (s, e) => ChooseLabSolutionsFolder();
+
+        tabs = Add(this, new TabControl { Enabled = false }, 8, 64, 684, 522);
         var backupTab = new TabPage("Backup");
         var restoreTab = new TabPage("Restore");
         tabs.TabPages.Add(backupTab);
@@ -735,16 +927,16 @@ class MainForm : Form
         BuildRestoreTab(restoreTab);
 
         // Activity log
-        Add(this, new Label(), 10, 536, 200, 20, "Activity:");
-        txtLog = Add(this, new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical }, 8, 556, 684, 176);
+        Add(this, new Label(), 10, 592, 200, 20, "Activity:");
+        txtLog = Add(this, new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical }, 8, 612, 684, 176);
         txtLog.Font = new Font("Consolas", 9);
         Util.Logged += line => txtLog.AppendText(line + "\r\n");
 
         timer.Tick += (s, e) => BackupTick();
-        Load += (s, e) => LoadSettings();
+        Shown += (s, e) => SearchLabSolutions();
         FormClosing += (s, e) =>
         {
-            if (busy && !Ask("A .zip file is still being written or unpacked. Close anyway? The file will be incomplete."))
+            if (busy && !Ask("The tool is still working (see the status text). Close anyway? A .zip file being written or unpacked will be incomplete."))
                 e.Cancel = true;
         };
     }
@@ -753,20 +945,24 @@ class MainForm : Form
     {
         // 1. Choose
         var grp = Add(page, new GroupBox(), 6, 4, 664, 250, "1. Choose the backup to restore");
-        txtRestoreRoot = FolderRow(grp, 24, "Backups are in:");
+        Add(grp, new Label(), 12, 27, 175, 20, "Where is the backup?");
+        Add(grp, new Button(), 190, 21, 210, 28, "Choose a backup folder...").Click += (s, e) => ChooseRestoreFolder();
+        btnOpenZip = Add(grp, new Button(), 408, 21, 244, 28, "Choose a one-file backup (.zip)...");
+        btnOpenZip.Click += (s, e) => UnpackZip();
+        Add(grp, new Label(), 12, 59, 175, 20, "Looking in:");
+        txtRestoreRoot = Add(grp, new TextBox(), 190, 56, 370, 23);
         txtRestoreRoot.Leave += (s, e) => RefreshRestoreList();
+        Add(grp, new Button(), 566, 55, 86, 25, "Refresh").Click += (s, e) => RefreshRestoreList();
         lstRestore = Add(grp, new ListView
         {
             View = View.Details, FullRowSelect = true, MultiSelect = false, HideSelection = false, GridLines = true
-        }, 12, 56, 640, 150);
+        }, 12, 88, 640, 118);
         lstRestore.Columns.Add("Backup date", 140);
         lstRestore.Columns.Add("Type", 230);
         lstRestore.Columns.Add("Folder", 246);
-        Add(grp, new Button(), 12, 212, 110, 28, "Refresh list").Click += (s, e) => RefreshRestoreList();
-        btnSaveZip = Add(grp, new Button(), 130, 212, 250, 28, "Save selected backup as one file (.zip)...");
+        btnSaveZip = Add(grp, new Button(), 12, 212, 270, 28, "Save selected backup as one file (.zip)...");
         btnSaveZip.Click += (s, e) => SaveSelectedAsZip();
-        btnOpenZip = Add(grp, new Button(), 388, 212, 264, 28, "Restore from a one-file backup (.zip)...");
-        btnOpenZip.Click += (s, e) => UnpackZip();
+        Add(grp, new Label { ForeColor = Color.DimGray }, 290, 218, 362, 20, "...to carry it to another PC, e.g. on a USB stick.");
 
         // 2. Options
         grp = Add(page, new GroupBox(), 6, 258, 664, 90, "2. Restore options");
@@ -802,6 +998,7 @@ class MainForm : Form
     {
         busy = true;
         btnRun.Enabled = btnRestore.Enabled = btnSaveZip.Enabled = btnOpenZip.Enabled = false;
+        btnSearch.Enabled = btnChooseLs.Enabled = false;
         status.ForeColor = Color.DarkBlue;
         status.Text = what + "...";
         int last = -1;
@@ -820,6 +1017,7 @@ class MainForm : Form
             {
                 busy = false;
                 btnRun.Enabled = btnRestore.Enabled = btnSaveZip.Enabled = btnOpenZip.Enabled = true;
+                btnSearch.Enabled = btnChooseLs.Enabled = true;
                 if (error != null)
                 {
                     status.ForeColor = Color.DarkRed;
@@ -941,6 +1139,128 @@ class MainForm : Form
                  "It is now selected in the list. Before restoring on a new PC, LabSolutions must be installed there " +
                  "and its database created in the same folder as on the old PC (manual section 4).");
         });
+    }
+
+    // Finds LabSolutions: first the quick places, then (in the background) every local drive.
+    void SearchLabSolutions()
+    {
+        string system, program;
+        Locator.FindQuick(out system, out program);
+        if (system != null && program != null)
+        {
+            ApplyLocation(system, program);
+            return;
+        }
+
+        busy = true;
+        tabs.Enabled = btnSearch.Enabled = btnChooseLs.Enabled = false;
+        lblLocation.ForeColor = Color.DarkBlue;
+        lblLocation.Text = "Searching all drives for LabSolutions...";
+        Util.Log("LabSolutions is not in the usual places. Searching all local drives...");
+        DateTime lastShown = DateTime.MinValue;
+        Action<string> progress = dir =>
+        {
+            if ((DateTime.Now - lastShown).TotalMilliseconds < 300) return;
+            lastShown = DateTime.Now;
+            BeginInvoke((Action)(() => lblLocation.Text = "Searching... " + dir));
+        };
+        var thread = new System.Threading.Thread(() =>
+        {
+            try { Locator.Search(progress, ref system, ref program); }
+            catch { }
+            BeginInvoke((Action)(() =>
+            {
+                busy = false;
+                btnSearch.Enabled = btnChooseLs.Enabled = true;
+                if (system != null && program != null) ApplyLocation(system, program);
+                else NotFound(system, program);
+            }));
+        });
+        thread.IsBackground = true;
+        thread.Start();
+    }
+
+    void ApplyLocation(string system, string program)
+    {
+        Paths.SystemDir = system;
+        Paths.ProgramDir = program;
+        Locator.Remember();
+        lblLocation.ForeColor = Color.DarkGreen;
+        lblLocation.Text = string.Equals(system, program, StringComparison.OrdinalIgnoreCase)
+            ? system
+            : system + "     (programs: " + program + ")";
+        Util.Log("LabSolutions found: " + system + "  -  programs: " + program);
+        tabs.Enabled = true;
+        LoadSettings();
+    }
+
+    void NotFound(string system, string program)
+    {
+        tabs.Enabled = false;
+        lblLocation.ForeColor = Color.DarkRed;
+        lblLocation.Text = "LabSolutions was not found. Click 'Choose folder...' to point to it.";
+        Error("LabSolutions was not found on this PC" +
+              (system != null ? " (only its data folder " + system + ")" : "") +
+              (program != null ? " (only its program folder " + program + ")" : "") + ".\r\n\r\n" +
+              "Is LabSolutions installed? It must be installed before a backup can be restored here.\r\n\r\n" +
+              "If it is installed, click 'Choose folder...' and choose the LabSolutions folder " +
+              @"(the one with the System\config folder inside, usually C:\LabSolutions).");
+    }
+
+    string PickFolder(string description, Func<string, bool> isRight, string wrongMessage)
+    {
+        while (true)
+        {
+            using (var dlg = new FolderBrowserDialog { Description = description, ShowNewFolderButton = false })
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+                if (isRight(dlg.SelectedPath)) return dlg.SelectedPath;
+                if (!Ask(wrongMessage + "\r\n\r\nChoose another folder?")) return null;
+            }
+        }
+    }
+
+    void ChooseLabSolutionsFolder()
+    {
+        string system, program;
+        Locator.FindQuick(out system, out program);
+
+        string picked = PickFolder(
+            @"Choose the LabSolutions folder (the one with System\config inside, usually C:\LabSolutions).",
+            d => Locator.IsSystemDir(d) || Locator.IsProgramDir(d),
+            @"This is not a LabSolutions folder. It should contain the folder System\config " +
+            "(data folder), or LSSSystemBackup.exe (program folder).");
+        if (picked == null) return;
+        if (Locator.IsSystemDir(picked)) system = picked;
+        if (Locator.IsProgramDir(picked)) program = picked;
+
+        if (program == null)
+            program = PickFolder(
+                @"Now choose the LabSolutions program folder (with LSSSystemBackup.exe, usually C:\Program Files (x86)\LabSolutions).",
+                Locator.IsProgramDir, "LSSSystemBackup.exe / LSSSystemRestore.exe are not in this folder.");
+        if (system == null)
+            system = PickFolder(
+                @"Now choose the LabSolutions data folder (with System\config inside, usually C:\LabSolutions).",
+                Locator.IsSystemDir, @"There is no System\config folder with the backup settings in this folder.");
+        if (system != null && program != null) ApplyLocation(system, program);
+    }
+
+    void ChooseRestoreFolder()
+    {
+        string picked = PickFolder(
+            "Choose the folder with the backup: a FullBackup_... folder, or the folder that contains them " +
+            "(for example on a USB stick or network drive).",
+            d => Restore.Find(d).Count > 0,
+            "No LabSolutions backup was found in this folder (folders named FullBackup_<date>). " +
+            "If you have a .zip file instead, use 'Choose a one-file backup (.zip)'.");
+        if (picked == null) return;
+        txtRestoreRoot.Text = picked;
+        RefreshRestoreList();
+        if (lstRestore.Items.Count > 0)
+        {
+            lstRestore.Items[0].Selected = true;
+            lstRestore.Focus();
+        }
     }
 
     void LoadRestoreSettings()
@@ -1213,7 +1533,9 @@ class MainForm : Form
 
     void LoadSettings()
     {
-        try
+        if (!File.Exists(Paths.Config))
+            Util.Log("WARNING: " + Paths.Config + " was not found. Backups from this PC will not work (restoring still can).");
+        else try
         {
             XmlDocument xml = Config.Load();
             txtBackup.Text = Config.Get(xml, "BackupPath");
